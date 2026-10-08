@@ -17,6 +17,7 @@ from vidsitu_code.seq_gen import SeqGenCustom, EncoderOut
 from transformers import GPT2LMHeadModel
 from vidsitu_code.hf_gpt2_fseq import HuggingFaceGPT2Decoder
 import time
+from vidsitu_code.state_transition import StateTransitionRepresentation
 
 
 class SlowFast_FeatModel(SlowFast):
@@ -257,13 +258,14 @@ class PPState(nn.Module):
         assert frames.shape[1:] == self.shape
         shape = frames.shape
         # B x E x T x state_dim
-        states = torch.ones(shape[0], shape[1], shape[3], shape[2]+self.C, device="cuda")
+        states = torch.ones(shape[0], shape[1], shape[3], shape[2]+self.C, device=frames.device, dtype=frames.dtype)
         for i in range(shape[0]):
             for j in range(shape[1]):
                 for t in range(shape[3]):
                     obj = bbox[i, j, t]
-                    if obj[0] >= obj[2] and obj[1] >= obj[3]:
-                        pixel_feat = torch.zeros(shape[2], device="cuda")
+                    if obj[0] >= obj[2] or obj[1] >= obj[3]:
+                        states[i, j, t] = 0
+                        continue
                     else:
                         pixel_feat = frames[i, j, :, t, obj[0]:obj[2], obj[1]:obj[3]].mean(dim=(1, 2))
                     if self.C == 0:
@@ -287,9 +289,16 @@ class StateAgg(nn.Module, ABC):
         out = []
         for i in range(bbox.shape[2]):
             states = self.state_creator(frames, bbox[:, :, i])
-            out.append(self.seq_mdl(states.view(vn, frames.shape[3], -1)))
+            valid = (bbox[:, :, i, :, 2] > bbox[:, :, i, :, 0]) & (bbox[:, :, i, :, 3] > bbox[:, :, i, :, 1])
+            out.append(self.aggregate_states(
+                states.view(vn, frames.shape[3], -1),
+                valid.reshape(vn, frames.shape[3])))
         out = torch.stack(out)
         return out.permute((1, 0, 2))
+
+
+    def aggregate_states(self, states, valid):
+        return self.seq_mdl(states)
 
 
 class LSTMAgg(StateAgg):
@@ -311,7 +320,19 @@ class AvgAgg(StateAgg):
         self.avg_mdl = nn.AdaptiveAvgPool1d(1)
 
     def seq_mdl(self, states):
-        return self.avg_mdl(states.permute(0, 2, 1)).squeeze()
+        return self.avg_mdl(states.permute(0, 2, 1)).squeeze(-1)
+
+
+class TransitionAgg(AvgAgg):
+    def __init__(self, shape, C, cfg):
+        super().__init__(shape, C)
+        self.transition = StateTransitionRepresentation(
+            shape[1] + C, window_size=cfg.window_size, stride=cfg.stride,
+            hidden_dim=cfg.hidden_dim, mode=cfg.mode, heads=cfg.heads,
+            dropout=cfg.dropout)
+
+    def aggregate_states(self, states, valid):
+        return self.transition(states, valid, self.seq_mdl(states))
 
 
 class SFBaseEC(SFBase):
@@ -321,6 +342,10 @@ class SFBaseEC(SFBase):
         self.vfeat_head = nn.Linear(din, 768)
         self.slow_agg = AvgAgg((5, 2048, 8, 7, 7), self.cfg.C)
         self.fast_agg = AvgAgg((5, 256, 32, 7, 7), self.cfg.C)
+        transition_cfg = getattr(self.cfg, "state_transition", None)
+        if transition_cfg is not None and transition_cfg.enabled:
+            self.slow_agg = TransitionAgg((5, 2048, 8, 7, 7), self.cfg.C, transition_cfg)
+            self.fast_agg = TransitionAgg((5, 256, 32, 7, 7), self.cfg.C, transition_cfg)
         self.num_obj = self.cfg.num_obj
 
     def forward_encoder(self, inp):

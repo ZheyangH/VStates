@@ -122,3 +122,76 @@ Logs are stored inside `tmp/` directory. When you run the code with $exp_name th
 - `predictions`: the validation outputs of current best model.
 
 Logs are also stored using [MLFlow](https://www.mlflow.org/docs/latest/tracking.html). These can be uploaded to other experiment trackers such as [neptune.ai](https://neptune.ai/), [wandb](https://wandb.ai/site) for better visualization of results.
+
+## Sliding-window state-transition extension
+
+This extension adds an optional object-track-local transition branch immediately
+following OSE construction and before temporal aggregation. It encodes ordered
+windows of projected states and their adjacent signed differences. The summary
+is fused into the original average-pooled OME through a learned gated residual;
+output dimensions and downstream model interfaces are preserved.
+
+Two encoders are available:
+
+- `mlp`: concatenate ordered window states and signed adjacent differences.
+- `attention`: local self-attention with learned time positions and projected
+  differences. Attention operates within one object's window, never across batch
+  examples or object identities.
+
+The branch is disabled by default. To train the MLP variant:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python main_dist.py transition_mlp \
+  --mdl.mdl_name=sf_ec_cat --mdl.C=128 \
+  --mdl.state_transition.enabled=True \
+  --mdl.state_transition.mode=mlp \
+  --mdl.state_transition.window_size=3 \
+  --mdl.state_transition.stride=1 \
+  --train.bs=1 --train.bsv=1 --train.lr=3e-5 \
+  --mdl.load_sf_pretrained=True --train.resume=False --do_dist=False
+```
+
+For attention, use `--mdl.state_transition.mode=attention`. The defaults are
+hidden size 128, four attention heads, and zero dropout. The hidden size must be
+divisible by the head count. Window width is measured in backbone feature time
+steps, so an identical width in Slow and Fast pathways covers different durations.
+
+Missing/degenerate boxes are zeroed. Only windows with all observations valid
+contribute to the transition summary; transitions do not bridge missing frames.
+Sequences shorter than the window or tracks with no valid windows keep their
+original OME. The original OME still averages all time positions, including
+zero-filled missing states, to retain the baseline aggregation convention.
+The implementation also fixes singleton batch squeezing and allocates OSE on
+the input device, allowing aggregation checks on CPU.
+
+This is an **implicit transition representation**, not supervised semantic
+states such as "standing -> lying". Candidate tracks serve as argument candidates;
+there is no ground-truth role input or explicit role-conditioned transition model.
+The same aggregation is used for the union region when `sf_ec_rel` is selected.
+
+For semantic-role prediction, train the modified verb model first, then
+re-extract visual features using `vidsitu_code/feat_extractor.py` with the same
+`mdl.state_transition` settings, and train the role decoder on those new features.
+Enabling transitions adds parameters, so original checkpoints are not directly
+compatible with strict resume of an enabled model. SlowFast backbone pretraining
+can still be loaded using the existing pretrained-backbone option.
+
+### Verification and experiment boundaries
+
+Run CPU tests (requires PyTorch; no Fairseq, SlowFast, video data, or GPU needed):
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Tests cover both encoders, ordered input sensitivity, missing observations,
+short sequences, strides, gradients, and integration with the actual OSE and
+aggregation classes. Full dataset training and accuracy gains have not been
+validated. Fairseq and the other original dependencies remain necessary for the
+original training entry point, including verb classification because its shared
+model file imports Fairseq at module import time.
+
+Recommended comparisons: disabled baseline, MLP, attention, window widths 2/3/5,
+and a parameter-matched temporal baseline. Keep data, seeds, sampling and compute
+budgets comparable. Validate event direction and role errors in addition to the
+original metrics; extra parameters alone do not establish a transition benefit.
